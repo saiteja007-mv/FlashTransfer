@@ -102,8 +102,8 @@ class DiscoveryThread(QThread):
         
         try:
             sock.bind(('', self.port))
-        except:
-            self.log.emit(f"Discovery port {self.port} in use")
+        except Exception as e:
+            self.log.emit(f"Discovery port {self.port} in use: {e}")
             return
         
         sock.settimeout(1)
@@ -130,8 +130,9 @@ class DiscoveryThread(QThread):
                     pass
             except socket.timeout:
                 continue
-            except:
-                break
+            except Exception as e:
+                if self.running:
+                    self.log.emit(f"Discovery error: {e}")
         
         sock.close()
     
