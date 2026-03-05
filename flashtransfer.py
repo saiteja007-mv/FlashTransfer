@@ -2,6 +2,7 @@
 """
 FlashTransfer - Fast Cross-Platform File Transfer
 GUI application for transferring large files between Linux and Windows
+With Auto-Discovery - devices on same network auto-detect each other
 """
 
 import sys
@@ -10,6 +11,7 @@ import os
 import json
 import hashlib
 import threading
+import struct
 from pathlib import Path
 from datetime import datetime
 
@@ -19,7 +21,7 @@ try:
         QPushButton, QLabel, QProgressBar, QFileDialog, QLineEdit,
         QTextEdit, QGroupBox, QSpinBox, QMessageBox, QSplitter,
         QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-        QSystemTrayIcon, QMenu
+        QSystemTrayIcon, QMenu, QListWidget, QListWidgetItem
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
     from PyQt6.QtGui import QIcon, QFont, QPalette, QColor
@@ -32,7 +34,7 @@ except ImportError:
         QPushButton, QLabel, QProgressBar, QFileDialog, QLineEdit,
         QTextEdit, QGroupBox, QSpinBox, QMessageBox, QSplitter,
         QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-        QSystemTrayIcon, QMenu
+        QSystemTrayIcon, QMenu, QListWidget, QListWidgetItem
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
     from PyQt6.QtGui import QIcon, QFont, QPalette, QColor
@@ -40,6 +42,128 @@ except ImportError:
 
 CHUNK_SIZE = 8192  # 8KB chunks for optimal large file transfer
 DEFAULT_PORT = 55432
+DISCOVERY_PORT = 55433
+BROADCAST_ADDR = '<broadcast>'
+DISCOVERY_INTERVAL = 3  # seconds
+
+
+class DiscoveryThread(QThread):
+    """Background thread for device discovery"""
+    device_found = pyqtSignal(str, str, str)  # ip, hostname, platform
+    device_lost = pyqtSignal(str)  # ip
+    log = pyqtSignal(str)
+    
+    def __init__(self, port=DISCOVERY_PORT):
+        super().__init__()
+        self.port = port
+        self.running = True
+        self.devices = {}  # ip -> last_seen
+        self.own_ip = self._get_own_ip()
+        
+    def _get_own_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except:
+            return "127.0.0.1"
+    
+    def run(self):
+        # Start listener thread
+        listener = threading.Thread(target=self._listen_for_beacons, daemon=True)
+        listener.start()
+        
+        # Start broadcaster thread
+        broadcaster = threading.Thread(target=self._broadcast_beacon, daemon=True)
+        broadcaster.start()
+        
+        # Monitor device timeouts
+        while self.running:
+            current_time = datetime.now().timestamp()
+            timeout_ips = []
+            
+            for ip, last_seen in self.devices.items():
+                if current_time - last_seen > 10:  # 10 second timeout
+                    timeout_ips.append(ip)
+            
+            for ip in timeout_ips:
+                del self.devices[ip]
+                self.device_lost.emit(ip)
+            
+            self.msleep(1000)  # Check every second
+    
+    def _listen_for_beacons(self):
+        """Listen for discovery beacons from other devices"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        
+        try:
+            sock.bind(('', self.port))
+        except:
+            self.log.emit(f"Discovery port {self.port} in use")
+            return
+        
+        sock.settimeout(1)
+        
+        while self.running:
+            try:
+                data, addr = sock.recvfrom(1024)
+                ip = addr[0]
+                
+                # Ignore self
+                if ip == self.own_ip:
+                    continue
+                
+                try:
+                    beacon = json.loads(data.decode())
+                    if beacon.get('app') == 'FlashTransfer':
+                        self.devices[ip] = datetime.now().timestamp()
+                        self.device_found.emit(
+                            ip,
+                            beacon.get('hostname', 'Unknown'),
+                            beacon.get('platform', 'Unknown')
+                        )
+                except:
+                    pass
+            except socket.timeout:
+                continue
+            except:
+                break
+        
+        sock.close()
+    
+    def _broadcast_beacon(self):
+        """Broadcast discovery beacon"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(0.5)
+        
+        beacon = {
+            'app': 'FlashTransfer',
+            'hostname': socket.gethostname(),
+            'platform': sys.platform,
+            'port': DEFAULT_PORT,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        beacon_data = json.dumps(beacon).encode()
+        
+        while self.running:
+            try:
+                sock.sendto(beacon_data, (BROADCAST_ADDR, self.port))
+            except:
+                pass
+            
+            self.msleep(DISCOVERY_INTERVAL * 1000)
+        
+        sock.close()
+    
+    def stop(self):
+        self.running = False
+        self.wait(1000)
 
 
 class FileTransferThread(QThread):
@@ -340,6 +464,22 @@ class ModernStyle:
             QTabBar::tab:hover:!selected {
                 background-color: #505050;
             }
+            QListWidget {
+                background-color: #2d2d2d;
+                color: white;
+                border: 2px solid #3d3d3d;
+                border-radius: 5px;
+            }
+            QListWidget::item {
+                padding: 10px;
+                border-bottom: 1px solid #3d3d3d;
+            }
+            QListWidget::item:selected {
+                background-color: #0078d4;
+            }
+            QListWidget::item:hover {
+                background-color: #3d3d3d;
+            }
         """)
 
 
@@ -347,12 +487,15 @@ class FlashTransferApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("⚡ FlashTransfer - Fast File Transfer")
-        self.setMinimumSize(900, 700)
+        self.setMinimumSize(1000, 800)
         
         self.transfer_thread = None
+        self.discovery_thread = None
         self.history = []
+        self.discovered_devices = {}  # ip -> {hostname, platform}
         
         self.init_ui()
+        self.setup_discovery()
         self.setup_auto_refresh()
     
     def init_ui(self):
@@ -367,13 +510,20 @@ class FlashTransferApp(QMainWindow):
         header = QLabel("⚡ FlashTransfer")
         header.setFont(QFont("Segoe UI", 24, QFont.Weight.Bold))
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        header.setStyleSheet("color: #0078d4; margin-bottom: 10px;")
+        header.setStyleSheet("color: #0078d4; margin-bottom: 5px;")
         layout.addWidget(header)
         
-        subtitle = QLabel("Fast Cross-Platform File Transfer (Linux ↔ Windows)")
+        subtitle = QLabel("Auto-Discovering File Transfer (Linux ↔ Windows)")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setStyleSheet("color: #888888; margin-bottom: 20px;")
+        subtitle.setStyleSheet("color: #888888; margin-bottom: 10px;")
         layout.addWidget(subtitle)
+        
+        # Discovered Devices Banner
+        devices_banner = QLabel("🔍 Auto-Discovery Active - Looking for devices on network...")
+        devices_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        devices_banner.setStyleSheet("background-color: #0078d4; color: white; padding: 8px; border-radius: 5px;")
+        layout.addWidget(devices_banner)
+        self.devices_banner = devices_banner
         
         # Tabs
         tabs = QTabWidget()
@@ -387,12 +537,16 @@ class FlashTransferApp(QMainWindow):
         receive_tab = self.create_receive_tab()
         tabs.addTab(receive_tab, "📥 Receive File")
         
+        # Devices Tab
+        devices_tab = self.create_devices_tab()
+        tabs.addTab(devices_tab, "📱 Devices")
+        
         # History Tab
         history_tab = self.create_history_tab()
         tabs.addTab(history_tab, "📋 History")
         
         # Status bar
-        self.status = QLabel("Ready")
+        self.status = QLabel("Ready - Auto-discovery running")
         self.status.setStyleSheet("color: #888888; padding: 5px;")
         layout.addWidget(self.status)
     
@@ -400,6 +554,21 @@ class FlashTransferApp(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setSpacing(15)
+        
+        # Discovered Devices Section
+        devices_group = QGroupBox("📱 Discovered Devices (Click to Connect)")
+        devices_layout = QVBoxLayout(devices_group)
+        
+        self.devices_list = QListWidget()
+        self.devices_list.itemClicked.connect(self.on_device_selected)
+        self.devices_list.setMaximumHeight(120)
+        devices_layout.addWidget(self.devices_list)
+        
+        self.refresh_devices_btn = QPushButton("🔄 Refresh Devices")
+        self.refresh_devices_btn.clicked.connect(self.refresh_devices)
+        devices_layout.addWidget(self.refresh_devices_btn)
+        
+        layout.addWidget(devices_group)
         
         # File Selection
         file_group = QGroupBox("File Selection")
@@ -430,7 +599,7 @@ class FlashTransferApp(QMainWindow):
         host_layout = QHBoxLayout()
         host_layout.addWidget(QLabel("Target IP Address:"))
         self.host_input = QLineEdit()
-        self.host_input.setPlaceholderText("e.g., 192.168.1.100")
+        self.host_input.setPlaceholderText("Select from discovered devices or type manually...")
         host_layout.addWidget(self.host_input)
         conn_layout.addLayout(host_layout)
         
@@ -576,6 +745,46 @@ class FlashTransferApp(QMainWindow):
         
         return widget
     
+    def create_devices_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        
+        # Header
+        header = QLabel("📱 Discovered FlashTransfer Devices")
+        header.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(header)
+        
+        # Description
+        desc = QLabel("These devices are running FlashTransfer on your network. Click to auto-fill IP.")
+        desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        desc.setStyleSheet("color: #888888;")
+        layout.addWidget(desc)
+        
+        # Devices table
+        self.devices_table = QTableWidget()
+        self.devices_table.setColumnCount(4)
+        self.devices_table.setHorizontalHeaderLabels(["IP Address", "Hostname", "Platform", "Status"])
+        self.devices_table.horizontalHeader().setStretchLastSection(True)
+        self.devices_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.devices_table.itemClicked.connect(self.on_table_device_selected)
+        layout.addWidget(self.devices_table)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        
+        refresh_btn = QPushButton("🔄 Scan Network")
+        refresh_btn.clicked.connect(self.refresh_devices)
+        btn_layout.addWidget(refresh_btn)
+        
+        clear_btn = QPushButton("🗑️ Clear List")
+        clear_btn.clicked.connect(self.clear_devices)
+        btn_layout.addWidget(clear_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        return widget
+    
     def create_history_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -596,6 +805,113 @@ class FlashTransferApp(QMainWindow):
         layout.addWidget(clear_btn)
         
         return widget
+    
+    def setup_discovery(self):
+        """Start device discovery thread"""
+        self.discovery_thread = DiscoveryThread()
+        self.discovery_thread.device_found.connect(self.on_device_found)
+        self.discovery_thread.device_lost.connect(self.on_device_lost)
+        self.discovery_thread.log.connect(self.log_discovery)
+        self.discovery_thread.start()
+    
+    def on_device_found(self, ip, hostname, platform):
+        """Handle newly discovered device"""
+        if ip not in self.discovered_devices:
+            self.discovered_devices[ip] = {
+                'hostname': hostname,
+                'platform': platform,
+                'last_seen': datetime.now()
+            }
+            
+            # Update list widget
+            self.update_devices_list()
+            
+            # Update table
+            self.update_devices_table()
+            
+            # Update banner
+            self.devices_banner.setText(f"🔍 Found {len(self.discovered_devices)} device(s) on network")
+            self.devices_banner.setStyleSheet("background-color: #00aa00; color: white; padding: 8px; border-radius: 5px;")
+            
+            self.status.setText(f"Discovered: {hostname} ({ip})")
+    
+    def on_device_lost(self, ip):
+        """Handle device timeout"""
+        if ip in self.discovered_devices:
+            del self.discovered_devices[ip]
+            self.update_devices_list()
+            self.update_devices_table()
+            
+            if len(self.discovered_devices) == 0:
+                self.devices_banner.setText("🔍 Auto-Discovery Active - Looking for devices...")
+                self.devices_banner.setStyleSheet("background-color: #0078d4; color: white; padding: 8px; border-radius: 5px;")
+    
+    def update_devices_list(self):
+        """Update the devices list widget"""
+        self.devices_list.clear()
+        
+        for ip, info in self.discovered_devices.items():
+            platform_icon = "🐧" if "linux" in info['platform'].lower() else "🪟" if "win" in info['platform'].lower() else "💻"
+            item_text = f"{platform_icon} {info['hostname']} ({ip})"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.ItemDataRole.UserRole, ip)
+            self.devices_list.addItem(item)
+        
+        if self.devices_list.count() == 0:
+            self.devices_list.addItem("No devices found yet... Make sure other devices are running FlashTransfer")
+    
+    def update_devices_table(self):
+        """Update the devices table"""
+        self.devices_table.setRowCount(len(self.discovered_devices))
+        
+        for row, (ip, info) in enumerate(self.discovered_devices.items()):
+            self.devices_table.setItem(row, 0, QTableWidgetItem(ip))
+            self.devices_table.setItem(row, 1, QTableWidgetItem(info['hostname']))
+            self.devices_table.setItem(row, 2, QTableWidgetItem(info['platform']))
+            
+            last_seen = (datetime.now() - info['last_seen']).seconds
+            status = "🟢 Online" if last_seen < 5 else "🟡 Away" if last_seen < 15 else "🔴 Offline"
+            self.devices_table.setItem(row, 3, QTableWidgetItem(status))
+    
+    def on_device_selected(self, item):
+        """Handle device selection from list"""
+        ip = item.data(Qt.ItemDataRole.UserRole)
+        if ip:
+            self.host_input.setText(ip)
+            self.status.setText(f"Selected device: {ip}")
+    
+    def on_table_device_selected(self, item):
+        """Handle device selection from table"""
+        row = item.row()
+        ip = self.devices_table.item(row, 0).text()
+        self.host_input.setText(ip)
+        self.status.setText(f"Selected device: {ip}")
+    
+    def refresh_devices(self):
+        """Manually refresh device list"""
+        self.status.setText("Scanning network...")
+        # Force a discovery broadcast by briefly restarting discovery
+        if self.discovery_thread:
+            self.discovery_thread.stop()
+            self.discovery_thread.wait()
+        
+        self.discovery_thread = DiscoveryThread()
+        self.discovery_thread.device_found.connect(self.on_device_found)
+        self.discovery_thread.device_lost.connect(self.on_device_lost)
+        self.discovery_thread.log.connect(self.log_discovery)
+        self.discovery_thread.start()
+        
+        self.status.setText("Network scan started")
+    
+    def clear_devices(self):
+        """Clear discovered devices"""
+        self.discovered_devices.clear()
+        self.update_devices_list()
+        self.update_devices_table()
+    
+    def log_discovery(self, msg):
+        """Log discovery messages"""
+        pass  # Silent discovery
     
     def get_local_ip(self):
         """Get local IP address"""
@@ -637,7 +953,7 @@ class FlashTransferApp(QMainWindow):
             return
         
         if not host:
-            QMessageBox.warning(self, "Error", "Please enter target IP address!")
+            QMessageBox.warning(self, "Error", "Please enter target IP address or select a discovered device!")
             return
         
         self.send_btn.setEnabled(False)
@@ -741,8 +1057,16 @@ class FlashTransferApp(QMainWindow):
         self.timer.start(1000)
     
     def refresh_ui(self):
-        # Update IP in case network changes
-        pass
+        # Update device status in table
+        self.update_devices_table()
+    
+    def closeEvent(self, event):
+        """Clean up threads on close"""
+        if self.discovery_thread:
+            self.discovery_thread.stop()
+        if self.transfer_thread:
+            self.transfer_thread.stop()
+        event.accept()
 
 
 def main():
