@@ -642,7 +642,6 @@ class FlashTransferApp(QMainWindow):
         
         self.send_log = QTextEdit()
         self.send_log.setReadOnly(True)
-        self.send_log.setMaximumBlockCount(100)
         log_layout.addWidget(self.send_log)
         
         layout.addWidget(log_group)
